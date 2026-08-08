@@ -1,0 +1,244 @@
+name: SmartSub 订阅聚合 (每6小时)
+
+# 触发条件
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时一次 (UTC 00/06/12/18 -> 北京 08/14/20/02 点)
+    - cron: '0 */6 * * *'
+
+# 赋予 GITHUB_TOKEN 写权限（用于提交心跳，保活仓库）
+permissions:
+  contents: write
+
+# 防并发：上一次未结束则本次排队
+concurrency:
+  group: smartsub-fetch
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+
+    - name: 迁出代码
+      uses: actions/checkout@v4
+
+    - name: 安装Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: 加载缓存(pip)
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: 缓存代理二进制
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/smartsub
+        key: ${{ runner.os }}-smartsub-binaries-${{ hashFiles('scripts/download_singbox.py', 'scripts/download_mihomo.py') }}
+        restore-keys: |
+          ${{ runner.os }}-smartsub-binaries-
+
+    - name: 设置时区
+      run: sudo timedatectl set-timezone 'Asia/Shanghai'
+
+    - name: 安装依赖
+      run: pip install -r ./requirements.txt
+
+    - name: 配置自检
+      run: python scripts/self_check.py || echo "⚠️ self_check 提示警告"
+
+    - name: 验证 Secrets 配置
+      env:
+        GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GIST_ID: ${{ secrets.GIST_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        chmod +x scripts/validate_secrets.sh
+        bash scripts/validate_secrets.sh
+
+    - name: Run main.py (抓取聚合)
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      run: python ./main.py || echo "⚠️ main.py 执行遇到错误，但继续执行"
+
+    - name: Select dynamic probe head (optional)
+      if: success() || failure()
+      run: |
+        if [ -s "collected_nodes.txt" ]; then
+          echo "🛰️ Selecting dynamic probe head..."
+          python ./node_quality_filter.py --probe-only || echo "⚠️ probe-only 执行失败"
+        else
+          echo "⚠️ collected_nodes.txt 不存在或为空，跳过动态探测头"
+        fi
+
+    - name: Bootstrap sing-box proxy (optional)
+      if: success() || failure()
+      env:
+        FALLBACK_PROXY_URL: ${{ vars.DYNAMIC_PROBE_PROXY_URL }}
+      run: |
+        PROXY_URL=""
+        mkdir -p runtime
+        if [ -f "runtime/probe_head.json" ]; then
+          echo "🧩 生成 sing-box 配置..."
+          python ./scripts/generate_singbox_config.py --probe-json runtime/probe_head.json --output runtime/singbox-probe.json --http-port 7891 --socks-port 7890
+          echo "⬇️ 下载 sing-box..."
+          python ./scripts/download_singbox.py --output ./sing-box
+          chmod +x ./sing-box
+          ./sing-box version || true
+          echo "🔎 校验 sing-box 配置..."
+          if ! ./sing-box check -c runtime/singbox-probe.json; then
+            echo "⚠️ sing-box 配置校验失败，切换备用客户端"
+          else
+            echo "🚀 启动 sing-box 本地代理..."
+            ./sing-box run -c runtime/singbox-probe.json > runtime/singbox.log 2>&1 &
+            sleep 5
+            if curl -fsS -m 8 --connect-timeout 5 -x http://127.0.0.1:7891 https://www.google.com/generate_204 >/dev/null; then
+              PROXY_URL="http://127.0.0.1:7891"
+              echo "SINGBOX_PROXY_STARTED=1" >> $GITHUB_ENV
+              echo "✅ sing-box 代理可用"
+            else
+              echo "⚠️ sing-box 代理测试失败，切换备用客户端"
+              echo "---- sing-box.log (tail) ----"
+              tail -n 200 runtime/singbox.log || true
+              ps aux | grep '[s]ing-box' || true
+              ss -lntp 2>/dev/null | grep 7891 || true
+            fi
+          fi
+
+          if [ -z "$PROXY_URL" ]; then
+            echo "🧩 生成 mihomo 配置..."
+            python ./scripts/generate_mihomo_config.py --probe-json runtime/probe_head.json --output runtime/mihomo-probe.yaml --mixed-port 7892 --log-level info
+            echo "⬇️ 下载 mihomo..."
+            python ./scripts/download_mihomo.py --output ./mihomo
+            chmod +x ./mihomo
+            ./mihomo -v || true
+            echo "🚀 启动 mihomo 本地代理..."
+            ./mihomo -f runtime/mihomo-probe.yaml > runtime/mihomo.log 2>&1 &
+            sleep 5
+            if curl -fsS -m 8 --connect-timeout 5 -x http://127.0.0.1:7892 https://www.google.com/generate_204 >/dev/null; then
+              PROXY_URL="http://127.0.0.1:7892"
+              echo "MIHOMO_PROXY_STARTED=1" >> $GITHUB_ENV
+              echo "✅ mihomo 代理可用"
+            else
+              echo "⚠️ mihomo 代理测试失败"
+              echo "---- mihomo.log (tail) ----"
+              tail -n 200 runtime/mihomo.log || true
+              ps aux | grep '[m]ihomo' || true
+              ss -lntp 2>/dev/null | grep 7892 || true
+            fi
+          fi
+
+          if [ -n "$PROXY_URL" ]; then
+            echo "DYNAMIC_PROBE_PROXY_URL=$PROXY_URL" >> $GITHUB_ENV
+          elif [ -n "$FALLBACK_PROXY_URL" ]; then
+            echo "⚠️ 本地代理失败，使用回退代理"
+            echo "DYNAMIC_PROBE_PROXY_URL=$FALLBACK_PROXY_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ 本地代理失败，且未配置回退代理"
+          fi
+        elif [ -n "$FALLBACK_PROXY_URL" ]; then
+          echo "⚠️ 未生成 probe_head.json，使用回退代理"
+          echo "DYNAMIC_PROBE_PROXY_URL=$FALLBACK_PROXY_URL" >> $GITHUB_ENV
+        else
+          echo "⚠️ 未生成 probe_head.json，且未配置回退代理"
+        fi
+
+    - name: Fetch CN probe results (optional)
+      env:
+        CN_PROBE_URL: ${{ secrets.CN_PROBE_URL }}
+        CN_PROBE_TOKEN: ${{ secrets.CN_PROBE_TOKEN }}
+      if: ${{ env.CN_PROBE_URL != '' }}
+      run: |
+        mkdir -p sub
+        if [ -n "$CN_PROBE_URL" ]; then
+          echo "Fetching CN probe results..."
+          if [ -n "$CN_PROBE_TOKEN" ]; then
+            curl -fsSL -H "Authorization: Bearer $CN_PROBE_TOKEN" "$CN_PROBE_URL" -o sub/cn_probe.json || echo "⚠️ CN probe fetch failed"
+          else
+            curl -fsSL "$CN_PROBE_URL" -o sub/cn_probe.json || echo "⚠️ CN probe fetch failed"
+          fi
+        fi
+
+    - name: Run Quality Filter & 发布私密 Gist
+      if: success() || failure()
+      timeout-minutes: 40
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GIST_TOKEN || secrets.GITHUB_TOKEN }}
+        GIST_ID: ${{ secrets.GIST_ID }}
+        SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      run: |
+        if [ -f "sub/sub_all_url_check.txt" ] || [ -f "collected_nodes.txt" ]; then
+          echo "✅ 发现节点文件，开始筛选..."
+          python ./node_quality_filter.py || echo "⚠️ 节点筛选遇到错误"
+          if [ -f "sub/high_quality_nodes.txt" ]; then
+            echo "🔗 生成订阅 URL (私密 Gist)..."
+            python ./generate_subscription_url.py || echo "⚠️ 订阅URL生成遇到错误"
+          else
+            echo "⚠️ 未发现高质量节点文件，跳过订阅URL生成"
+          fi
+        else
+          echo "⚠️ 未发现节点文件，跳过筛选"
+        fi
+
+    - name: 写运行心跳 (仅保活, 不含节点数据)
+      if: success() || failure()
+      run: |
+        mkdir -p runtime
+        COUNT=0
+        if [ -f "sub/high_quality_nodes.txt" ]; then
+          COUNT=$(grep -c . sub/high_quality_nodes.txt || true)
+        fi
+        cat > runtime/last_run.json <<EOF
+        {
+          "last_run": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "high_quality_nodes": ${COUNT}
+        }
+        EOF
+        echo "💓 heartbeat: ${COUNT} high-quality nodes"
+
+    - name: 输出订阅链接到 Job Summary
+      if: success() || failure()
+      run: |
+        if [ -f "runtime/high_quality_nodes_urls.txt" ]; then
+          echo "## 本次订阅 (私密 Gist, 仅持链接者可见)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -m1 "订阅URL:" runtime/high_quality_nodes_urls.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Commit 心跳
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add -f runtime/last_run.json
+        if git diff --staged --quiet; then
+          echo "📝 无变更，跳过提交"
+        else
+          git commit -m "💓 heartbeat $(date '+%Y-%m-%d %H:%M:%S')"
+          git pull --rebase --autostash origin main || true
+        fi
+
+    - name: 推送
+      if: success()
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: main
